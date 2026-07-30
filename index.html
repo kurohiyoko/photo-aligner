@@ -1,1467 +1,1213 @@
-// ===== 状態管理 =====
-let running = false;
-let analysisOn = true;
-let mode = 'skeleton';
-let jawTrail = [];
-let jerkHistory = [];
-let lastJawX = null;
-let recording = false;
-let recordedFrames = [];
-let replayTimer = null;
-let deviceTilt = 0;
-
-// 発音チェック（あ・い・う・え・お）用状態
-let vowelRecording = false;
-let afterVowelCheckCallback = null;
-let smileRecording = false;
-let smileFrames = [];
-let smilePhotoCaptured = null;
-let lastVowelCornerAvg = 0, lastVowelNoseAvg = 0, lastVowelCheekAvg = 0;
-let lastSmileCornerAvg = 0, lastSmileCheekAvg = 0;
-let vowelFrames = [];
-
-// ① 手ブレ平滑化バッファ（直近6フレーム移動平均）
-const smoothBuf = [];
-const SMOOTH_N = 6;
-function smoothJaw(rawX, rawY) {
-  smoothBuf.push({ x: rawX, y: rawY });
-  if (smoothBuf.length > SMOOTH_N) smoothBuf.shift();
-  const sx = smoothBuf.reduce((s, p) => s + p.x, 0) / smoothBuf.length;
-  const sy = smoothBuf.reduce((s, p) => s + p.y, 0) / smoothBuf.length;
-  return { x: sx, y: sy };
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>顎運動セルフチェック｜波鍼灸院</title>
+<style>
+:root {
+  --bg: #f7f4e9;
+  --surface: #faf8f0;
+  --surface2: #efe6e0;
+  --border: rgba(180,150,145,0.2);
+  --accent: #7d95a3;
+  --accent-rgb: 125,149,163;
+  --accent2: #b3906f;
+  --warn: #c99a63;
+  --danger: #c17f8a;
+  --text: #4a3f3c;
+  --text2: #8c7f79;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Noto Sans JP', sans-serif;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
 }
 
-const video = document.getElementById('video');
-const canvas = document.getElementById('canvas');
-const ctx = canvas.getContext('2d');
-const trajCanvas = document.getElementById('trajCanvas');
-const tjCtx = trajCanvas.getContext('2d');
-const replayCanvas = document.getElementById('replayCanvas');
-const rpCtx = replayCanvas.getContext('2d');
-const jerkCanvas = document.getElementById('jerkCanvas');
-const jkCtx = jerkCanvas.getContext('2d');
-
-// ランドマーク番号
-const LM = {
-  JAW: 152, NOSE: 168, LIP_T: 13, LIP_B: 14,
-  MOUTH_L: 61, MOUTH_R: 291,
-  EYE_L: 33, EYE_R: 263,
-  BROW_L: 70, BROW_R: 300,
-  NOSTRIL_L: 129, NOSTRIL_R: 358,
-  CHEEK_L: 234, CHEEK_R: 454,
-  FOREHEAD: 10,
-  JAW_L: 172, JAW_R: 397,
-  EYE_L_TOP: 159, EYE_L_BOT: 145,
-  EYE_R_TOP: 386, EYE_R_BOT: 374,
-};
-
-function resizeCanvas() {
-  const wrap = document.querySelector('.camera-wrap');
-  canvas.width = wrap.clientWidth;
-  canvas.height = wrap.clientHeight;
+/* ヘッダー */
+header {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
 }
-window.addEventListener('resize', resizeCanvas);
-resizeCanvas();
+.logo { font-size: 12px; color: var(--text2); }
+.logo strong { color: var(--accent); font-size: 14px; }
+.header-right { display: flex; gap: 8px; align-items: center; }
+.badge {
+  font-size: 10px;
+  padding: 3px 8px;
+  border-radius: 4px;
+}
+.badge-warn { background: rgba(246,173,85,0.12); color: var(--warn); border: 1px solid rgba(246,173,85,0.3); }
+.badge-ok { background: rgba(104,211,145,0.12); color: var(--accent2); border: 1px solid rgba(104,211,145,0.3); }
+.badge-env { background: rgba(var(--accent-rgb),0.1); color: var(--text2); border: 1px solid var(--border); }
 
-// ===== スマホ傾き検知 =====
-window.addEventListener('deviceorientation', (e) => {
-  deviceTilt = e.gamma || 0; // 左右傾き
-  const tiltAbs = Math.abs(deviceTilt);
-  const bar = document.getElementById('tiltBar');
-  const label = document.getElementById('tiltLabel');
-  const pct = 50 + (deviceTilt / 45) * 50;
-  bar.style.width = Math.max(5, Math.min(95, pct)) + '%';
-  if (tiltAbs < 5) {
-    bar.style.background = '#68d391';
-    label.textContent = 'スマホ水平 ✓';
-    label.style.color = '#68d391';
-  } else if (tiltAbs < 15) {
-    bar.style.background = '#f6ad55';
-    label.textContent = `${deviceTilt > 0 ? '右' : '左'}に${tiltAbs.toFixed(0)}°傾いています`;
-    label.style.color = '#f6ad55';
+/* 操作ガイドボタン */
+.tour-btn {
+  background: rgba(var(--accent-rgb), 0.13);
+  border: 1px solid rgba(var(--accent-rgb), 0.35);
+  color: var(--accent);
+  font-size: 11px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+/* 操作ガイド（ツアー）オーバーレイ */
+.tour-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  display: none;
+  pointer-events: none;
+}
+.tour-dim {
+  position: absolute;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  transition: clip-path 0.35s ease;
+}
+.tour-caption {
+  position: absolute;
+  background: var(--surface2);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 12px 14px;
+  width: min(80vw, 300px);
+  pointer-events: all;
+  transition: top 0.35s ease, left 0.35s ease;
+}
+.tour-caption-title { font-size: 13px; font-weight: 700; color: var(--accent); margin-bottom: 4px; }
+.tour-caption-text { font-size: 12px; color: var(--text); line-height: 1.6; margin-bottom: 10px; }
+.tour-caption-foot { display: flex; align-items: center; justify-content: space-between; }
+.tour-dots { display: flex; gap: 5px; }
+.tour-dot { width: 6px; height: 6px; border-radius: 50%; background: rgba(255,255,255,0.25); }
+.tour-dot.active { background: var(--accent); }
+.tour-btns { display: flex; gap: 6px; }
+.tour-skip, .tour-next {
+  font-size: 11px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text2);
+}
+.tour-next { background: var(--accent); color: #292929; border-color: var(--accent); font-weight: 700; }
+
+/* ON/OFFスイッチ */
+.switch-wrap { display: flex; align-items: center; gap: 6px; }
+.switch-label { font-size: 11px; color: var(--text2); }
+.switch {
+  position: relative;
+  width: 40px;
+  height: 22px;
+  background: var(--surface2);
+  border-radius: 11px;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.3s;
+}
+.switch.on { background: var(--accent2); }
+.switch::after {
+  content: '';
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  background: white;
+  border-radius: 50%;
+  top: 2px;
+  left: 2px;
+  transition: left 0.3s;
+}
+.switch.on::after { left: 20px; }
+
+/* メインレイアウト */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+/* カメラエリア */
+.camera-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 340px;
+  background: var(--surface2);
+  overflow: hidden;
+}
+#video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);
+  display: none;
+}
+#canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* 起動前画面 */
+.start-screen {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 30px;
+  text-align: center;
+}
+.start-screen h2 { font-size: 20px; font-weight: 500; color: var(--accent); opacity: 0.85; margin-bottom: 10px; }
+.start-screen p { font-size: 12px; color: var(--text2); line-height: 1.8; margin-bottom: 20px; }
+.btn-start {
+  background: rgba(var(--accent-rgb), 0.85);
+  border: 1px solid rgba(var(--accent-rgb), 1);
+  color: #fff;
+  padding: 12px 36px;
+  border-radius: 6px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn-glasses-yes, .btn-glasses-no {
+  font-size: 18px;
+  padding: 20px;
+  border-radius: 10px;
+}
+.btn-glasses-no { background: var(--surface2); border: 1px solid var(--border); color: var(--text); }
+
+/* ===== 見やすいモード（メガネを外す方向け・装飾より大きさ優先） ===== */
+body.large-mode .start-check-btn,
+body.large-mode .btn-start {
+  font-size: 22px !important;
+  padding: 24px !important;
+  border-radius: 12px !important;
+}
+body.large-mode .tour-btn,
+body.large-mode .badge,
+body.large-mode .streak-banner,
+body.large-mode .share-btn,
+body.large-mode .mode-bar {
+  display: none !important;
+}
+body.large-mode .panel-tabs { font-size: 16px !important; }
+body.large-mode .panel-tab { padding: 14px 6px !important; }
+body.large-mode .total-score-num { font-size: 46px !important; }
+body.large-mode .overall-summary { font-size: 16px !important; }
+body.large-mode .overall-summary b { font-size: 20px !important; }
+body.large-mode .pc-suggest {
+  display: block !important;
+  background: rgba(var(--accent-rgb),0.15);
+  border: 2px solid var(--accent);
+  border-radius: 10px;
+  padding: 16px;
+  font-size: 16px;
+  font-weight: 700;
+  text-align: center;
+  margin-bottom: 12px;
+  color: var(--text);
+}
+.pc-suggest { display: none; }
+
+/* カメラ上オーバーレイUI */
+.cam-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  display: none;
+}
+
+/* 顔位置ガイド枠 — JSで描画するため非表示 */
+.face-guide-top-msg {
+  position: absolute;
+  top: 46px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(255,255,255,0.92);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 7px 16px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  z-index: 15;
+  pointer-events: none;
+}
+
+/* 傾きインジケーター — テキスト表示のみ残す */
+.tilt-indicator {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  pointer-events: none;
+}
+.tilt-bar-wrap { display: none; }
+.tilt-bar { display: none; }
+.tilt-label {
+  font-size: 11px;
+  font-weight: 500;
+  background: rgba(255,255,255,0.88);
+  padding: 3px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+/* スコアオーバーレイ（カメラ上） */
+.score-overlay {
+  position: absolute;
+  bottom: 70px;
+  left: 10px;
+  right: 10px;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+.score-chip {
+  background: rgba(255,255,255,0.88);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  text-align: center;
+  backdrop-filter: blur(4px);
+}
+.score-chip-label { font-size: 9px; color: var(--text2); margin-bottom: 2px; }
+.score-chip-val { font-size: 16px; font-weight: 500; }
+
+/* 環境警告 */
+.env-warning {
+  position: absolute;
+  top: 50px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(246,173,85,0.9);
+  color: #292929;
+  font-size: 11px;
+  padding: 5px 14px;
+  border-radius: 4px;
+  white-space: nowrap;
+  display: none;
+}
+
+/* 継続利用バナー */
+.streak-banner {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(255,255,255,0.9);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  font-size: 11px;
+  padding: 6px 14px;
+  border-radius: 14px;
+  white-space: nowrap;
+  display: none;
+  z-index: 20;
+}
+
+/* モード切替 */
+.mode-bar {
+  position: absolute;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  background: rgba(255,255,255,0.92);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  pointer-events: all;
+}
+.mode-btn {
+  padding: 7px 14px;
+  font-size: 11px;
+  border: none;
+  background: transparent;
+  color: var(--text2);
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+.mode-btn.active { background: var(--accent); color: #292929; font-weight: 600; }
+
+/* 録画ボタン */
+.rec-btn-wrap {
+  position: absolute;
+  bottom: 10px;
+  right: 10px;
+  pointer-events: all;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-end;
+}
+.rec-btn {
+  background: rgba(255,255,255,0.92);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  padding: 7px 14px;
+  border-radius: 8px;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.rec-btn.recording { background: rgba(252,129,129,0.2); animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+
+/* チェック開始ボタン（統合・シンプル操作） */
+.start-check-wrap {
+  position: absolute;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  pointer-events: all;
+}
+.start-check-btn {
+  background: rgba(var(--accent-rgb), 0.75);
+  color: #292929;
+  border: 1px solid rgba(var(--accent-rgb), 0.9);
+  padding: 12px 26px;
+  border-radius: 24px;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 3px 10px rgba(var(--accent-rgb), 0.35);
+  white-space: nowrap;
+}
+.start-check-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* 発音チェックボタン（録画ボタンと同系統・色だけ変更） */
+.vowel-btn {
+  background: rgba(255,255,255,0.92);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+.vowel-btn:disabled { opacity: 0.6; cursor: default; }
+
+/* 発音チェック案内オーバーレイ */
+.vowel-prompt {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: rgba(255,255,255,0.96);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 18px 22px;
+  text-align: center;
+  display: none;
+  pointer-events: none;
+  width: 78%;
+  max-width: 320px;
+}
+.vowel-prompt-text { font-size: 15px; color: var(--accent); font-weight: 500; margin-bottom: 12px; line-height: 1.6; }
+.vowel-prompt-bar-wrap { height: 6px; background: var(--surface2); border-radius: 3px; overflow: hidden; }
+.vowel-prompt-bar { height: 100%; width: 0%; background: var(--accent); transition: width 0.1s linear; }
+
+/* チェック中止ボタン */
+.cancel-check-btn {
+  position: absolute;
+  top: 46px;
+  right: 10px;
+  z-index: 60;
+  background: rgba(255,255,255,0.9);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  padding: 6px 12px;
+  border-radius: 16px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+/* ステージ間の告知バナー */
+.stage-announce {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255,255,255,0.88);
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 700;
+  text-align: center;
+  padding: 0 30px;
+  line-height: 1.7;
+  z-index: 50;
+  white-space: pre-line;
+}
+
+/* カウントダウン（3・2・1） */
+.countdown-box {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 110px;
+  height: 110px;
+  background: rgba(255,255,255,0.92);
+  border: 2px solid var(--accent);
+  border-radius: 14px;
+  color: var(--accent);
+  font-size: 52px;
+  font-weight: 800;
+  z-index: 60;
+}
+
+/* 追加チェック（笑顔）：カメラを隠して背景＋文字のみ */
+.smile-stage-overlay {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface2);
+  z-index: 70;
+}
+.smile-stage-text {
+  color: var(--accent);
+  font-size: 34px;
+  font-weight: 800;
+  text-align: center;
+  padding: 0 20px;
+  white-space: pre-line;
+}
+
+/* 下パネル */
+.bottom-panel {
+  flex-shrink: 0;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  display: none;
+}
+.bottom-panel.highlight {
+  animation: panelPulse 1.4s ease 2;
+}
+@keyframes panelPulse {
+  0%, 100% { box-shadow: none; }
+  50% { box-shadow: inset 0 0 0 2px var(--accent), 0 0 16px rgba(var(--accent-rgb), 0.4); }
+}
+
+/* パネルタブ */
+.back-to-camera-btn {
+  display: block;
+  width: 100%;
+  background: rgba(var(--accent-rgb),0.1);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--accent);
+  padding: 12px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.panel-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+}
+.panel-tab {
+  flex: 1;
+  padding: 9px 4px;
+  background: transparent;
+  border: none;
+  color: var(--text2);
+  font-size: 11px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: all 0.2s;
+}
+.panel-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.panel-body {
+  padding: 12px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+.panel-section { display: none; }
+.panel-section.active { display: block; }
+
+/* 部位別スコア */
+.parts-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.part-card {
+  background: var(--surface2);
+  border-radius: 6px;
+  padding: 8px 6px;
+  text-align: center;
+}
+.part-name { font-size: 10px; color: var(--text2); margin-bottom: 4px; }
+.part-score { font-size: 18px; font-weight: 500; }
+.part-bar-wrap {
+  margin-top: 4px;
+  height: 3px;
+  background: rgba(255,255,255,0.1);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.part-bar { height: 100%; border-radius: 2px; transition: width 0.2s; }
+
+/* 総合スコアメーター */
+.overall-summary {
+  background: rgba(var(--accent-rgb),0.1);
+  border: 1px solid rgba(var(--accent-rgb),0.3);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--text);
+}
+.overall-summary b { color: var(--accent); font-size: 15px; }
+
+.total-score-wrap {
+  background: var(--surface2);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.total-score-num { font-size: 44px; font-weight: 300; letter-spacing: -2px; min-width: 70px; }
+.total-score-right { flex: 1; }
+.total-score-label { font-size: 11px; color: var(--text2); margin-bottom: 6px; }
+.meter-wrap {
+  height: 8px;
+  background: rgba(255,255,255,0.1);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.meter-bar {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.3s, background 0.3s;
+}
+.meter-status { font-size: 11px; margin-top: 5px; }
+
+/* 軌跡+スロー再生統合パネル — 縦並び大型表示 */
+.traj-replay-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.mini-canvas-wrap {
+  background: var(--surface2);
+  border-radius: 6px;
+  padding: 8px;
+}
+.traj-optional {
+  margin-bottom: 8px;
+}
+.traj-optional summary {
+  font-size: 11px;
+  color: var(--text2);
+  cursor: pointer;
+  padding: 8px 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 6px;
+}
+.traj-optional[open] summary { margin-bottom: 8px; }
+.mini-canvas-label { font-size: 10px; color: var(--text2); margin-bottom: 6px; }
+canvas.mini-c { width: 100%; height: 160px; border-radius: 4px; display: block; }
+
+.replay-controls {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.ctrl-sm {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text2);
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 10px;
+  cursor: pointer;
+}
+.ctrl-sm:hover { color: var(--accent); }
+.speed-sel {
+  font-size: 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text2);
+  padding: 3px 6px;
+  border-radius: 4px;
+  margin-left: auto;
+}
+
+/* 詳細数値 */
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+}
+.detail-item {
+  background: var(--surface2);
+  border-radius: 5px;
+  padding: 7px 10px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.detail-label { font-size: 10px; color: var(--text2); }
+.detail-val { font-size: 13px; font-weight: 500; }
+
+/* 発音チェック結果 */
+.vowel-result-empty { font-size: 11px; color: var(--text2); line-height: 1.8; padding: 10px 2px; }
+.vowel-result { display: flex; flex-direction: column; gap: 6px; }
+.vowel-item {
+  background: var(--surface2);
+  border-radius: 5px;
+  padding: 8px 10px;
+}
+.vowel-item-label { font-size: 10px; color: var(--text2); margin-bottom: 3px; }
+.vowel-item-val { font-size: 12px; font-weight: 500; line-height: 1.5; }
+.vowel-comment {
+  font-size: 11px;
+  color: var(--text2);
+  line-height: 1.7;
+  padding: 8px;
+  background: rgba(var(--accent-rgb), 0.07);
+  border: 1px solid rgba(var(--accent-rgb), 0.2);
+  border-radius: 5px;
+  margin-top: 2px;
+}
+
+/* 比較タブ */
+.compare-wrap { display: flex; gap: 8px; }
+.compare-col { flex: 1; text-align: center; }
+.compare-label { font-size: 11px; color: var(--text2); margin-bottom: 4px; }
+.compare-photo {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  aspect-ratio: 3/4;
+  object-fit: cover;
+}
+.compare-score { font-size: 20px; font-weight: 700; color: var(--accent); margin-top: 4px; }
+
+/* SNSシェア */
+.share-btn {
+  width: 100%;
+  margin-top: 8px;
+  padding: 9px;
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.share-btn:hover { background: rgba(var(--accent-rgb), 0.1); }
+
+/* カクつきグラフ */
+.jerk-wrap { background: var(--surface2); border-radius: 6px; padding: 8px; margin-bottom: 8px; }
+.jerk-label { font-size: 10px; color: var(--text2); margin-bottom: 6px; }
+
+/* ローディング */
+#loading {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.spinner {
+  width: 32px; height: 32px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin-bottom: 14px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading-text { font-size: 12px; color: var(--text2); }
+
+/* ユーティリティ */
+.good { color: var(--accent2); }
+.warn { color: var(--warn); }
+.danger { color: var(--danger); }
+.neutral { color: var(--accent); }
+</style>
+<script>
+(function() {
+  var today = new Date();
+  var month = today.getMonth() + 1;
+  var date = today.getDate();
+  var root = document.documentElement.style;
+
+  function setPalette(p) {
+    root.setProperty('--bg', p.bg);
+    root.setProperty('--surface', p.surface);
+    root.setProperty('--surface2', p.surface2);
+    root.setProperty('--accent', p.accent);
+    root.setProperty('--accent2', p.accent2);
+    root.setProperty('--accent-rgb', p.accentRgb);
+    root.setProperty('--border', p.border);
+  }
+
+  if (month === 1 && date === 1) {
+    // 元旦限定：お正月カラー
+    setPalette({
+      bg: '#fdf3f0',
+      surface: '#fffaf8',
+      surface2: '#fbe4de',
+      accent: '#c0392b',
+      accent2: '#c9a24a',
+      accentRgb: '192,57,43',
+      border: 'rgba(192,57,43,0.25)'
+    });
+  } else if (month >= 5 && month <= 10) {
+    // 夏（5〜10月）：涼しい配色
+    setPalette({
+      bg: '#eef4f6',
+      surface: '#f5fafb',
+      surface2: '#dde9ec',
+      accent: '#5c8a9e',
+      accent2: '#7fa8a0',
+      accentRgb: '92,138,158',
+      border: 'rgba(92,138,158,0.25)'
+    });
   } else {
-    bar.style.background = '#fc8181';
-    label.textContent = `傾き大 ${deviceTilt > 0 ? '右' : '左'}${tiltAbs.toFixed(0)}°`;
-    label.style.color = '#fc8181';
-  }
-  document.getElementById('d-device').textContent = `${deviceTilt > 0 ? 'R' : 'L'}${tiltAbs.toFixed(1)}°`;
-});
-
-// ===== 照明検知 =====
-function checkLighting(imageData) {
-  const data = imageData.data;
-  let sum = 0;
-  const step = 40;
-  let count = 0;
-  for (let i = 0; i < data.length; i += step * 4) {
-    sum += (data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114);
-    count++;
-  }
-  const avg = sum / count;
-  const warn = document.getElementById('envWarning');
-  const badge = document.getElementById('envBadge');
-  if (avg < 50) {
-    warn.textContent = '⚠ 暗すぎます。明るい場所で撮影してください';
-    warn.style.display = 'block';
-    badge.textContent = '照明 暗い';
-  } else if (avg > 220) {
-    warn.textContent = '⚠ 明るすぎます。直射日光を避けてください';
-    warn.style.display = 'block';
-    badge.textContent = '照明 明るすぎ';
-  } else {
-    warn.style.display = 'none';
-    badge.textContent = '照明 良好';
-  }
-}
-
-// ===== スコア計算ユーティリティ =====
-function scoreFromDiff(diff, maxDiff) {
-  return Math.min(100, Math.max(0, Math.round(100 - (diff / maxDiff) * 100)));
-}
-
-function colorClass(score) {
-  return score >= 80 ? 'good' : score >= 60 ? 'warn' : 'danger';
-}
-
-function setPartScore(id, score) {
-  const el = document.getElementById('ps-' + id);
-  const bar = document.getElementById('pb-' + id);
-  if (!el || !bar) return;
-  el.textContent = score;
-  el.className = 'part-score ' + colorClass(score);
-  bar.style.width = score + '%';
-  bar.style.background = score >= 80 ? '#68d391' : score >= 60 ? '#f6ad55' : '#fc8181';
-}
-
-// ===== MediaPipe結果処理 =====
-const faceMesh = new FaceMesh({
-  locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`
-});
-faceMesh.setOptions({
-  maxNumFaces: 1,
-  refineLandmarks: true,
-  minDetectionConfidence: 0.7,
-  minTrackingConfidence: 0.5,
-});
-faceMesh.onResults(onResults);
-
-let lightCheckCounter = 0;
-
-function onResults(results) {
-  if (!analysisOn) return;
-  const W = canvas.width;
-  const H = canvas.height;
-
-  // === カメラの実写映像はそのまま見せる（canvasは透明にしてvideoを透過）===
-  ctx.clearRect(0, 0, W, H);
-
-  // === 顔位置ガイド（人型シルエット。スマホ傾きで傾く）===
-  const tiltRad = (deviceTilt || 0) * Math.PI / 180;
-  const cx = W / 2;
-  const cy = H * 0.40;
-  const headRx = W * 0.22;
-  const headRy = H * 0.27;
-  const guideColor = Math.abs(deviceTilt || 0) < 5
-    ? 'rgba(140,150,150,0.55)'   // 通常時はグレー（主張しすぎない）
-    : Math.abs(deviceTilt || 0) < 15
-    ? 'rgba(246,173,85,0.8)'
-    : 'rgba(252,129,129,0.8)';
-  const guideFill = Math.abs(deviceTilt || 0) < 5
-    ? 'rgba(140,150,150,0.06)'
-    : Math.abs(deviceTilt || 0) < 15
-    ? 'rgba(246,173,85,0.1)'
-    : 'rgba(252,129,129,0.1)';
-
-  ctx.save();
-  ctx.translate(cx, cy);
-  ctx.rotate(tiltRad);
-
-  // 頭部（楕円）
-  ctx.beginPath();
-  ctx.ellipse(0, 0, headRx, headRy, 0, 0, Math.PI * 2);
-  ctx.fillStyle = guideFill;
-  ctx.fill();
-  ctx.strokeStyle = guideColor;
-  ctx.lineWidth = 2;
-  ctx.stroke();
-
-  // 肩（人型に見せるための曲線）
-  ctx.beginPath();
-  ctx.moveTo(-headRx * 1.6, headRy * 2.3);
-  ctx.quadraticCurveTo(-headRx * 1.3, headRy * 0.9, 0, headRy * 0.95);
-  ctx.quadraticCurveTo(headRx * 1.3, headRy * 0.9, headRx * 1.6, headRy * 2.3);
-  ctx.strokeStyle = guideColor;
-  ctx.lineWidth = 2;
-  ctx.stroke();
-
-  ctx.restore();
-
-  // ガイド文言は顔の上ではなく画面上部の固定バナーに表示（顔に文字を重ねない）
-  const guideMsgEl = document.getElementById('faceGuideTopMsg');
-  if (Math.abs(deviceTilt || 0) >= 5) {
-    guideMsgEl.textContent = Math.abs(deviceTilt) < 15 ? '📱 スマホをまっすぐ持ってください' : '📱 スマホがかなり傾いています';
-    guideMsgEl.style.display = 'block';
-    guideMsgEl.style.color = Math.abs(deviceTilt) < 15 ? 'var(--warn)' : 'var(--danger)';
-  } else {
-    guideMsgEl.style.display = 'none';
-  }
-
-  // 照明チェック（30フレームに1回）
-  lightCheckCounter++;
-  if (lightCheckCounter % 30 === 0) {
-    try {
-      const tmp = document.createElement('canvas');
-      tmp.width = 64; tmp.height = 48;
-      const tc = tmp.getContext('2d');
-      tc.drawImage(video, 0, 0, 64, 48);
-      checkLighting(tc.getImageData(0, 0, 64, 48));
-    } catch(e) {}
-  }
-
-  if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
-    guideMsgEl.textContent = '👤 グレーの人型に顔を合わせてください';
-    guideMsgEl.style.display = 'block';
-    guideMsgEl.style.color = 'var(--text2)';
-    return;
-  }
-
-  const lm = results.multiFaceLandmarks[0];
-
-  function px(l) { return { x: (1 - l.x) * W, y: l.y * H, z: l.z }; }
-
-  const jaw = px(lm[LM.JAW]);
-  const nose = px(lm[LM.NOSE]);
-  const lipT = px(lm[LM.LIP_T]);
-  const lipB = px(lm[LM.LIP_B]);
-  const mL = px(lm[LM.MOUTH_L]);
-  const mR = px(lm[LM.MOUTH_R]);
-  const eyeL = px(lm[LM.EYE_L]);
-  const eyeR = px(lm[LM.EYE_R]);
-  const browL = px(lm[LM.BROW_L]);
-  const browR = px(lm[LM.BROW_R]);
-  const nostL = px(lm[LM.NOSTRIL_L]);
-  const nostR = px(lm[LM.NOSTRIL_R]);
-  const cheekL = px(lm[LM.CHEEK_L]);
-  const cheekR = px(lm[LM.CHEEK_R]);
-  const forehead = px(lm[LM.FOREHEAD]);
-  const eyeLT = px(lm[LM.EYE_L_TOP]);
-  const eyeLB = px(lm[LM.EYE_L_BOT]);
-  const eyeRT = px(lm[LM.EYE_R_TOP]);
-  const eyeRB = px(lm[LM.EYE_R_BOT]);
-
-  const eyeDist = Math.hypot(eyeR.x - eyeL.x, eyeR.y - eyeL.y);
-  const faceH = Math.hypot(jaw.y - forehead.y, jaw.x - forehead.x);
-
-  // 手ブレ補正：鼻根を原点として相対座標
-  function rel(pt) {
-    return { x: pt.x - nose.x, y: pt.y - nose.y, z: pt.z };
-  }
-  const jawRel = rel(jaw);
-  const mLRel = rel(mL);
-  const mRRel = rel(mR);
-
-  // 各パーツ計算
-  const openDist = Math.hypot(lipB.y - lipT.y, lipB.x - lipT.x);
-  const openPct = Math.round((openDist / faceH) * 200);
-
-  // 手ブレ補正後の横ズレ
-  const jawShiftPx = jawRel.x;
-  const jawShiftMm = (jawShiftPx / eyeDist * 15).toFixed(1);
-
-  const eyeAngle = Math.atan2(eyeR.y - eyeL.y, eyeR.x - eyeL.x) * 180 / Math.PI;
-  const eyeOpenL = Math.abs(eyeLB.y - eyeLT.y);
-  const eyeOpenR = Math.abs(eyeRB.y - eyeRT.y);
-  const eyeOpenDiff = Math.abs(eyeOpenL - eyeOpenR);
-
-  const browDiff = Math.abs(browL.y - browR.y);
-  const cornerDiff = Math.abs(mLRel.y - mRRel.y);
-  const nostrilDiff = Math.abs(nostL.y - nostR.y);
-  const cheekDiff = Math.abs(cheekL.y - cheekR.y);
-  const jawContourDiff = Math.abs(jawShiftPx);
-
-  // ===== 発音チェック用指標（顕の大きさに依存しないよう eyeDist で正規化）=====
-  // 鼻の傾き：小鼻左右を結ぶ線の角度（度）
-  const noseAngle = Math.atan2(nostR.y - nostL.y, nostR.x - nostL.x) * 180 / Math.PI;
-  // 口角の高さ差（符号付き：正=右口角が高い、負=左口角が高い）
-  const cornerDiffNorm = ((mR.y - mL.y) / eyeDist) * 100;
-  // 頬の張り出し差（鼻中心からの横方向距離の左右差、符号付き：正=左頬の方が張り出している）
-  const cheekWidthDiffNorm = ((Math.abs(cheekL.x - nose.x) - Math.abs(cheekR.x - nose.x)) / eyeDist) * 100;
-
-  // 発音チェック中はフレームごとに記録
-  if (vowelRecording) {
-    vowelFrames.push({ cornerDiffNorm, noseAngle, cheekWidthDiffNorm, openPct });
-  }
-
-  // 笑顔チェック中はフレームごとに記録
-  if (smileRecording) {
-    smileFrames.push({ cornerDiffNorm, cheekWidthDiffNorm, noseAngle });
-  }
-
-  // 部位別スコア
-  const eyeScore = scoreFromDiff(Math.abs(eyeAngle) * 2 + eyeOpenDiff, eyeDist * 0.4);
-  const browScore = scoreFromDiff(browDiff, eyeDist * 0.3);
-  const cheekScore = scoreFromDiff(cheekDiff, faceH * 0.15);
-  const noseScore = scoreFromDiff(nostrilDiff, eyeDist * 0.2);
-  const mouthScore = scoreFromDiff(cornerDiff, eyeDist * 0.3);
-  const jawScore = scoreFromDiff(jawContourDiff, eyeDist * 0.3);
-
-  const totalScore = Math.round((eyeScore + browScore + cheekScore + noseScore + mouthScore + jawScore) / 6);
-
-  // 顔向きガイド更新（顔の上ではなく画面上部の固定バナーに表示）
-  const faceAngleY = Math.atan2(jaw.y - forehead.y, jaw.x - forehead.x) * 180 / Math.PI;
-  if (Math.abs(deviceTilt || 0) < 5) {
-    if (Math.abs(faceAngleY - 90) > 15) {
-      guideMsgEl.textContent = faceAngleY < 90 ? '▼ 少し下を向いてください' : '▲ 少し上を向いてください';
-      guideMsgEl.style.color = 'var(--warn)';
-      guideMsgEl.style.display = 'block';
-    } else {
-      guideMsgEl.style.display = 'none';
-    }
-  }
-
-  // ① スムージング適用
-  const jawSmooth = smoothJaw(jawRel.x + W / 2, jaw.y);
-
-  // ② 軌跡：録画中のみ記録（リセットは録画開始時）
-  if (recording && openPct > 3) {
-    jawTrail.push({ x: jawSmooth.x, y: jawSmooth.y });
-    if (jawTrail.length > 300) jawTrail.shift();
-  }
-
-  // カクつき
-  const jerk = lastJawX !== null ? Math.abs(jaw.x - lastJawX) : 0;
-  lastJawX = jaw.x;
-  jerkHistory.push(jerk);
-  if (jerkHistory.length > 120) jerkHistory.shift();
-
-  // 録画
-  if (recording) {
-    recordedFrames.push({ jaw, nose, mL, mR, eyeL, eyeR, jawRel, totalScore, openPct });
-    if (recordedFrames.length >= 300) stopRecording();
-  }
-
-  // ===== Canvas描画 =====
-  ctx.save();
-
-  if (mode === 'skeleton' || mode === 'combined') {
-    // ③ リアルタイム：録画中は軌跡、非録画時は現在位置の点のみ
-    if (recording && jawTrail.length > 1) {
-      for (let i = 1; i < jawTrail.length; i++) {
-        const a = i / jawTrail.length;
-        ctx.strokeStyle = `rgba(99,179,237,${a * 0.9})`;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(jawTrail[i-1].x, jawTrail[i-1].y);
-        ctx.lineTo(jawTrail[i].x, jawTrail[i].y);
-        ctx.stroke();
-      }
-    } else if (!recording) {
-      // 非録画時：現在の顎位置のみ点表示
-      ctx.fillStyle = 'rgba(99,179,237,0.7)';
-      ctx.beginPath();
-      ctx.arc(jawSmooth.x, jawSmooth.y, 6, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    // 中心軸
-    ctx.strokeStyle = 'rgba(246,173,85,0.8)';
-    ctx.lineWidth = 2.5;
-    ctx.setLineDash([6,5]);
-    ctx.beginPath();
-    ctx.moveTo(nose.x, nose.y);
-    ctx.lineTo(jaw.x, jaw.y);
-    ctx.stroke();
-    ctx.setLineDash([]);
-
-    // 顎先
-    ctx.fillStyle = totalScore >= 80 ? '#68d391' : totalScore >= 60 ? '#f6ad55' : '#fc8181';
-    ctx.beginPath();
-    ctx.arc(jaw.x, jaw.y, 5, 0, Math.PI*2);
-    ctx.fill();
-
-    // 口角
-    ctx.strokeStyle = 'rgba(104,211,145,0.85)';
-    ctx.lineWidth = 2.5;
-    ctx.beginPath();
-    ctx.moveTo(mL.x, mL.y);
-    ctx.lineTo(mR.x, mR.y);
-    ctx.stroke();
-
-    // 目ライン
-    ctx.strokeStyle = 'rgba(252,129,129,0.5)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(eyeL.x, eyeL.y);
-    ctx.lineTo(eyeR.x, eyeR.y);
-    ctx.stroke();
-
-    // 眉ライン
-    ctx.strokeStyle = 'rgba(246,173,85,0.5)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(browL.x, browL.y);
-    ctx.lineTo(browR.x, browR.y);
-    ctx.stroke();
-
-    // 小鼻
-    [nostL, nostR].forEach(pt => {
-      ctx.fillStyle = 'rgba(246,173,85,0.95)';
-      ctx.beginPath();
-      ctx.arc(pt.x, pt.y, 5, 0, Math.PI*2);
-      ctx.fill();
+    // 冬（11〜4月）：温かみのある配色
+    setPalette({
+      bg: '#f7f4e9',
+      surface: '#faf8f0',
+      surface2: '#efe6e0',
+      accent: '#b5876a',
+      accent2: '#b98a92',
+      accentRgb: '181,135,106',
+      border: 'rgba(181,135,106,0.2)'
     });
   }
-
-  if (mode === 'muscle' || mode === 'combined') {
-    // ④ 筋肉連動表示
-    const addHeat = (pt, radius, intensity, color) => {
-      const g = ctx.createRadialGradient(pt.x, pt.y, 2, pt.x, pt.y, radius);
-      g.addColorStop(0, color.replace('A', Math.min(0.7, intensity).toFixed(2)));
-      g.addColorStop(1, 'transparent');
-      ctx.fillStyle = g;
-      ctx.fillRect(0, 0, W, H);
-    };
-
-    // 開口量に連動（0〜1正規化）
-    const openRatio = Math.min(1, openPct / 60);
-    // 横ズレ（eyeDist比）
-    const shiftRatio = Math.min(1, Math.abs(jawShiftPx) / (eyeDist * 0.3));
-    // 左右どちらにズレているか
-    const shiftDir = jawShiftPx > 0 ? 1 : -1; // +1=右ズレ, -1=左ズレ
-
-    // 咬筋（両頬）：開口大で活性
-    const massBias = openRatio * 0.55;
-    addHeat(cheekR, eyeDist * 0.55, massBias, 'rgba(252,129,129,A)');
-    addHeat(cheekL, eyeDist * 0.55, massBias, 'rgba(252,129,129,A)');
-
-    // 側頭筋（こめかみ）：開口大で活性
-    const tempR = { x: eyeR.x - eyeDist * 0.3, y: eyeR.y - eyeDist * 0.5 };
-    const tempL = { x: eyeL.x + eyeDist * 0.3, y: eyeL.y - eyeDist * 0.5 };
-    const tempBias = openRatio * 0.5;
-    addHeat(tempR, eyeDist * 0.6, tempBias, 'rgba(246,173,85,A)');
-    addHeat(tempL, eyeDist * 0.6, tempBias, 'rgba(246,173,85,A)');
-
-    // 外側翼突筋（横ズレ方向の反対側が収縮）
-    // ズレ先と逆側の口角奥あたりに表示
-    const pteroExtR = { x: mR.x - eyeDist * 0.1, y: mR.y + eyeDist * 0.15 };
-    const pteroExtL = { x: mL.x + eyeDist * 0.1, y: mL.y + eyeDist * 0.15 };
-    if (shiftDir > 0) {
-      // 右ズレ → 左側の外側翼突筋が収縮
-      addHeat(pteroExtL, eyeDist * 0.35, shiftRatio * 0.6, 'rgba(99,179,237,A)');
-    } else {
-      addHeat(pteroExtR, eyeDist * 0.35, shiftRatio * 0.6, 'rgba(99,179,237,A)');
-    }
-
-    // 内側翼突筋（顎の内側・開口小＋ズレ時）
-    const closeRatio = Math.max(0, 1 - openRatio);
-    const pteroPt = { x: jawSmooth.x, y: jawSmooth.y - eyeDist * 0.1 };
-    addHeat(pteroPt, eyeDist * 0.3, closeRatio * shiftRatio * 0.5, 'rgba(104,211,145,A)');
-
-    // 凡例（右上に固定表示）
-    const legend = [
-      { color: 'rgba(252,129,129,0.8)', label: '咬筋' },
-      { color: 'rgba(246,173,85,0.8)',  label: '側頭筋' },
-      { color: 'rgba(99,179,237,0.8)',  label: '外側翼突筋' },
-      { color: 'rgba(104,211,145,0.8)', label: '内側翼突筋' },
-    ];
-    legend.forEach((item, i) => {
-      const lx = W - 100, ly = 12 + i * 18;
-      ctx.fillStyle = item.color;
-      ctx.fillRect(lx, ly, 12, 12);
-      ctx.fillStyle = 'rgba(255,255,255,0.8)';
-      ctx.font = '10px sans-serif';
-      ctx.textAlign = 'left';
-      ctx.fillText(item.label, lx + 16, ly + 10);
-    });
-  }
-
-  if (mode === 'avatar') {
-    // ===== マンガ風シンプルアバター表示（大ざっぱな左右差・動きの役）=====
-    // このモードのときだけ、見やすさのため背景を白にする（黒は使わない）
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, W, H);
-    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-    const acx = W / 2;
-    const acy = H * 0.42;
-    const arx = Math.min(W * 0.24, H * 0.30);
-    const ary = arx * 1.25;
-
-    const jawShiftN = clamp(jawShiftPx / (eyeDist * 0.5), -1, 1);          // 顎の横ズレ
-    const openN = clamp(openPct / 50, 0, 1);                                // 開口量
-    const cornerN = clamp(cornerDiffNorm / 6, -1, 1);                       // 口角差（正：左が上がりやすい）
-    const browN = clamp(((browR.y - browL.y) / eyeDist) * 100 / 4, -1, 1);  // 眨差（正：左が高い）
-    const cheekN = clamp(cheekWidthDiffNorm / 6, -1, 1);                    // 頬左右差（正：左が張り出し）
-    const noseN = clamp(noseAngle / 8, -1, 1);                              // 鼻の傾き
-    const eyeN = clamp(((eyeOpenL - eyeOpenR) / eyeDist) * 100 / 3, -1, 1); // 目の開き差（正：左が大きい）
-
-    ctx.save();
-    ctx.translate(acx, acy);
-
-    // 輪郭
-    ctx.beginPath();
-    ctx.ellipse(jawShiftN * arx * 0.12, 0, arx, ary, 0, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(125,149,163,0.07)';
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(99,179,237,0.75)';
-    ctx.lineWidth = 2.5;
-    ctx.stroke();
-
-    // 頬（左右差で大きさが変化）
-    const cheekBaseR = arx * 0.16;
-    ctx.fillStyle = 'rgba(252,129,129,0.35)';
-    ctx.beginPath();
-    ctx.ellipse(-arx * 0.58, ary * 0.18, cheekBaseR * (1 + Math.max(0, cheekN) * 0.4), cheekBaseR * (1 + Math.max(0, cheekN) * 0.4), 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.ellipse(arx * 0.58, ary * 0.18, cheekBaseR * (1 + Math.max(0, -cheekN) * 0.4), cheekBaseR * (1 + Math.max(0, -cheekN) * 0.4), 0, 0, Math.PI * 2);
-    ctx.fill();
-
-    // 眨
-    ctx.strokeStyle = 'rgba(45,55,72,0.85)';
-    ctx.lineWidth = 3;
-    ctx.lineCap = 'round';
-    const browY = -ary * 0.38;
-    ctx.beginPath();
-    ctx.moveTo(-arx * 0.55, browY - browN * ary * 0.10);
-    ctx.quadraticCurveTo(-arx * 0.35, browY - browN * ary * 0.10 - ary * 0.02, -arx * 0.15, browY - browN * ary * 0.10);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(arx * 0.15, browY + browN * ary * 0.10);
-    ctx.quadraticCurveTo(arx * 0.35, browY + browN * ary * 0.10 - ary * 0.02, arx * 0.55, browY + browN * ary * 0.10);
-    ctx.stroke();
-
-    // 目（開きの左右差）
-    const eyeY = -ary * 0.22;
-    const eyeW = arx * 0.16;
-    const eyeHBase = ary * 0.09;
-    ctx.lineWidth = 1.5;
-    ctx.fillStyle = '#f2f2f2';
-    ctx.strokeStyle = 'rgba(45,55,72,0.8)';
-    ctx.beginPath();
-    ctx.ellipse(-arx * 0.35, eyeY, eyeW, eyeHBase * (1 + clamp(eyeN, 0, 1) * 0.5), 0, 0, Math.PI * 2);
-    ctx.fill(); ctx.stroke();
-    ctx.fillStyle = '#2d3748';
-    ctx.beginPath();
-    ctx.arc(-arx * 0.35, eyeY, eyeHBase * 0.55 * (1 + clamp(eyeN, 0, 1) * 0.3), 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#f2f2f2';
-    ctx.beginPath();
-    ctx.ellipse(arx * 0.35, eyeY, eyeW, eyeHBase * (1 + clamp(-eyeN, 0, 1) * 0.5), 0, 0, Math.PI * 2);
-    ctx.fill(); ctx.stroke();
-    ctx.fillStyle = '#2d3748';
-    ctx.beginPath();
-    ctx.arc(arx * 0.35, eyeY, eyeHBase * 0.55 * (1 + clamp(-eyeN, 0, 1) * 0.3), 0, Math.PI * 2);
-    ctx.fill();
-
-    // 鼻（傾き）
-    ctx.strokeStyle = 'rgba(45,55,72,0.6)';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(noseN * arx * 0.04, -ary * 0.05);
-    ctx.lineTo(noseN * arx * 0.10, ary * 0.10);
-    ctx.stroke();
-
-    // 口（開口量＋口角の左右差）
-    const mouthY = ary * 0.5;
-    const mouthW = arx * 0.32;
-    const mouthOpenH = openN * ary * 0.22 + 2;
-    const cornerLY = mouthY - cornerN * ary * 0.08;
-    const cornerRY = mouthY + cornerN * ary * 0.08;
-    ctx.fillStyle = 'rgba(200,60,60,0.55)';
-    ctx.strokeStyle = 'rgba(45,55,72,0.7)';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(-mouthW, cornerLY);
-    ctx.quadraticCurveTo(0, mouthY + mouthOpenH, mouthW, cornerRY);
-    ctx.quadraticCurveTo(0, mouthY - mouthOpenH * 0.3, -mouthW, cornerLY);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-
-    ctx.restore();
-
-    ctx.fillStyle = 'rgba(45,55,72,0.55)';
-    ctx.font = '10px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('動きを誇張して表示（実際の度合いとは縮尺が異なります）', W / 2, H - 8);
-  }
-
-  ctx.restore();
-
-  // ===== UI更新 =====
-  // カメラオーバーレイ
-  document.getElementById('ov-open').textContent = openPct + '%';
-  const shiftEl = document.getElementById('ov-shift');
-  shiftEl.textContent = Math.abs(jawShiftMm) + 'mm';
-  shiftEl.className = 'score-chip-val ' + (Math.abs(jawShiftMm) < 3 ? 'good' : Math.abs(jawShiftMm) < 6 ? 'warn' : 'danger');
-  const totEl = document.getElementById('ov-total');
-  totEl.textContent = totalScore;
-  totEl.className = 'score-chip-val ' + colorClass(totalScore);
-
-  // 総合スコア
-  document.getElementById('totalScoreNum').textContent = totalScore;
-  document.getElementById('totalScoreNum').className = 'total-score-num ' + colorClass(totalScore);
-  const meter = document.getElementById('meterBar');
-  meter.style.width = totalScore + '%';
-  meter.style.background = totalScore >= 80 ? '#68d391' : totalScore >= 60 ? '#f6ad55' : '#fc8181';
-  const status = totalScore >= 80 ? '左右バランス良好' : totalScore >= 60 ? '軽度の左右差あり' : '左右差が目立ちます';
-  document.getElementById('meterStatus').textContent = status;
-  document.getElementById('meterStatus').className = 'meter-status ' + colorClass(totalScore);
-
-  // 部位別
-  setPartScore('eye', eyeScore);
-  setPartScore('brow', browScore);
-  setPartScore('cheek', cheekScore);
-  setPartScore('nose', noseScore);
-  setPartScore('mouth', mouthScore);
-  setPartScore('jaw', jawScore);
-
-  // 詳細
-  document.getElementById('d-open').textContent = openPct + '%';
-  document.getElementById('d-shift').textContent = Math.abs(jawShiftMm) + 'mm';
-  document.getElementById('d-corner').textContent = Math.round(cornerDiff) + 'px';
-  document.getElementById('d-eyetilt').textContent = Math.abs(eyeAngle).toFixed(1) + '°';
-  document.getElementById('d-brow').textContent = Math.round(browDiff) + 'px';
-  document.getElementById('d-nostril').textContent = Math.round(nostrilDiff) + 'px';
-  document.getElementById('d-cheek').textContent = Math.round(cheekDiff) + 'px';
-
-  // ミニキャンバス更新
-  drawTraj();
-  drawJerk();
-}
-
-function drawTraj() {
-  const w = trajCanvas.width = trajCanvas.offsetWidth || 140;
-  const h = trajCanvas.height = trajCanvas.offsetHeight || 120;
-  tjCtx.fillStyle = '#111827';
-  tjCtx.fillRect(0, 0, w, h);
-  tjCtx.strokeStyle = 'rgba(246,173,85,0.3)';
-  tjCtx.setLineDash([3,3]);
-  tjCtx.beginPath();
-  tjCtx.moveTo(w/2, 0);
-  tjCtx.lineTo(w/2, h);
-  tjCtx.stroke();
-  tjCtx.setLineDash([]);
-
-  if (jawTrail.length < 2) return;
-  const xs = jawTrail.map(p => p.x);
-  const ys = jawTrail.map(p => p.y);
-  const minX = Math.min(...xs), maxX = Math.max(...xs);
-  const minY = Math.min(...ys), maxY = Math.max(...ys);
-  const rx = Math.max(maxX - minX, 10);
-  const ry = Math.max(maxY - minY, 10);
-  const nx = x => (x - minX) / rx * (w - 20) + 10;
-  const ny = y => (y - minY) / ry * (h - 20) + 10;
-
-  for (let i = 1; i < jawTrail.length; i++) {
-    const a = i / jawTrail.length;
-    tjCtx.strokeStyle = `rgba(99,179,237,${a})`;
-    tjCtx.lineWidth = 1.5;
-    tjCtx.beginPath();
-    tjCtx.moveTo(nx(jawTrail[i-1].x), ny(jawTrail[i-1].y));
-    tjCtx.lineTo(nx(jawTrail[i].x), ny(jawTrail[i].y));
-    tjCtx.stroke();
-  }
-}
-
-function drawJerk() {
-  const w = jerkCanvas.width = jerkCanvas.offsetWidth || 300;
-  const h = 50;
-  jkCtx.clearRect(0, 0, w, h);
-  if (jerkHistory.length < 2) return;
-  const max = Math.max(10, ...jerkHistory);
-  const thresh = max * 0.6;
-  const bw = w / jerkHistory.length;
-  jerkHistory.forEach((v, i) => {
-    const bh = (v / max) * h;
-    jkCtx.fillStyle = v > thresh ? 'rgba(252,129,129,0.8)' : 'rgba(125,149,163,0.35)';
-    jkCtx.fillRect(i * bw, h - bh, bw - 0.5, bh);
-  });
-  const jerkCount = jerkHistory.filter(v => v > thresh).length;
-  document.getElementById('trajStatus').textContent =
-    `カクつき: ${jerkCount}回 / 直近${jerkHistory.length}フレーム`;
-}
-
-// ===== 録画 =====
-function startRecording() {
-  recordedFrames = [];
-  jawTrail = []; // ② 録画開始でリセット
-  smoothBuf.length = 0;
-  recording = true;
-  const btn = document.getElementById('btnRec');
-  btn.textContent = '■ 停止';
-  btn.classList.add('recording');
-  document.getElementById('trajStatus').textContent = '録画中...';
-}
-function stopRecording() {
-  recording = false;
-  const btn = document.getElementById('btnRec');
-  btn.textContent = '● 録画';
-  btn.classList.remove('recording');
-  document.getElementById('trajStatus').textContent =
-    recordedFrames.length > 0
-      ? `録画完了: ${recordedFrames.length}フレーム　▶ 再生 / 📷 保存`
-      : '録画データなし';
-}
-
-// ===== ①開口チェック（自動タイマー式） =====
-function startJawStage(onDone) {
-  const prompt = document.getElementById('jawPrompt');
-  const bar = document.getElementById('jawPromptBar');
-  prompt.style.display = 'block';
-  bar.style.width = '0%';
-
-  startRecording();
-
-  const duration = 5000; // 5秒間、開口動作を記録
-  const startT = performance.now();
-  function tick() {
-    const elapsed = performance.now() - startT;
-    bar.style.width = Math.min(100, (elapsed / duration) * 100) + '%';
-    if (elapsed < duration) {
-      requestAnimationFrame(tick);
-    } else {
-      stopRecording();
-      prompt.style.display = 'none';
-      onDone && onDone();
-    }
-  }
-  requestAnimationFrame(tick);
-}
-
-// ===== 数値表示・モード切替バーの表示ON/OFF（チェック中は隠してシンプルに） =====
-function setNumericVisible(visible) {
-  document.getElementById('scoreOverlay').style.display = visible ? '' : 'none';
-  document.getElementById('modeBar').style.display = visible ? '' : 'none';
-}
-
-// ===== 撮影画面 ⇔ 結果画面の完全切り替え（同時に両方は見せない） =====
-function showResultsScreen() {
-  document.getElementById('cameraWrap').style.display = 'none';
-  document.getElementById('bottomPanel').style.display = 'block';
-  window.scrollTo({ top: 0, behavior: 'smooth' });
-}
-function showCaptureScreen() {
-  document.getElementById('cameraWrap').style.display = '';
-  document.getElementById('bottomPanel').style.display = 'none';
-}
-
-// ===== 汎用ヘルパー =====
-function wait(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// 告知バナー（ステージの切り替わりを知らせる短い文言）
-function showAnnounce(text, duration) {
-  return new Promise(resolve => {
-    const el = document.getElementById('stageAnnounce');
-    el.textContent = text;
-    el.style.display = 'flex';
-    setTimeout(() => {
-      el.style.display = 'none';
-      resolve();
-    }, duration);
-  });
-}
-
-// カウントダウン（3・2・1／画面中央の四角い背景に表示）
-function runCountdown() {
-  return new Promise(resolve => {
-    const box = document.getElementById('countdownBox');
-    box.style.display = 'flex';
-    const seq = ['3', '2', '1'];
-    let i = 0;
-    function step() {
-      box.textContent = seq[i];
-      i++;
-      if (i < seq.length) {
-        setTimeout(step, 700);
-      } else {
-        setTimeout(() => {
-          box.style.display = 'none';
-          resolve();
-        }, 700);
-      }
-    }
-    step();
-  });
-}
-
-// startJawStage / startVowelCheck をPromise化（順番に await するため）
-function startJawStageP() {
-  return new Promise(resolve => startJawStage(resolve));
-}
-function startVowelCheckP() {
-  return new Promise(resolve => {
-    afterVowelCheckCallback = resolve;
-    startVowelCheck();
-  });
-}
-
-// ===== 追加チェック（笑顔）：カメラ映像を隠し、背景＋文字のみで進行 =====
-function startSmileStage(onDone) {
-  const overlay = document.getElementById('smileStageOverlay');
-  const text = document.getElementById('smileStageText');
-  overlay.style.display = 'flex';
-  smileFrames = [];
-  smilePhotoCaptured = null;
-
-  const seq = ['3', '2', '1', '😊\n笑ってください'];
-  let i = 0;
-  function step() {
-    text.textContent = seq[i];
-    if (i === seq.length - 1) {
-      smileRecording = true;
-      // 笑顔が安定する2秒後に写真を1枚撮影（画面表示はオーバーレイで隠したまま）
-      setTimeout(() => { smilePhotoCaptured = captureSnapshot(); }, 2000);
-      // 笑顔を4秒間保持してもらい、その間のフレームを記録
-      setTimeout(() => {
-        smileRecording = false;
-        overlay.style.display = 'none';
-        finishSmileCheck();
-        onDone && onDone();
-      }, 4000);
-    } else {
-      i++;
-      setTimeout(step, 700);
-    }
-  }
-  step();
-}
-function startSmileStageP() {
-  return new Promise(resolve => startSmileStage(resolve));
-}
-
-function finishSmileCheck() {
-  if (smilePhotoCaptured) {
-    document.getElementById('smilePhoto').src = smilePhotoCaptured;
-  }
-  if (smileFrames.length < 5) {
-    document.getElementById('sm-comment').textContent = '顔がうまく検出できませんでした。もう一度お試しください。';
-    document.getElementById('smileResultEmpty').style.display = 'none';
-    document.getElementById('smileResult').style.display = 'block';
-    return;
-  }
-  const avg = arr => arr.reduce((s, v) => s + v, 0) / arr.length;
-  const cornerAvg = avg(smileFrames.map(f => f.cornerDiffNorm));
-  const cheekAvg = avg(smileFrames.map(f => f.cheekWidthDiffNorm));
-  lastSmileCornerAvg = cornerAvg;
-  lastSmileCheekAvg = cheekAvg;
-
-  const CORNER_TH = 3.0;
-  const CHEEK_TH = 4.0;
-
-  let cornerText, cheekText;
-  if (Math.abs(cornerAvg) < CORNER_TH) {
-    cornerText = '笑顔でも左右差は小さく、バランス良く上がっています';
-  } else if (cornerAvg > 0) {
-    cornerText = '笑うと、左の口角がやや上がりやすい傾向があります';
-  } else {
-    cornerText = '笑うと、右の口角がやや上がりやすい傾向があります';
-  }
-  if (Math.abs(cheekAvg) < CHEEK_TH) {
-    cheekText = '笑顔時の頬の左右差は小さいです';
-  } else if (cheekAvg > 0) {
-    cheekText = '笑うと、左の頬がやや張り出しやすい傾向があります';
-  } else {
-    cheekText = '笑うと、右の頬がやや張り出しやすい傾向があります';
-  }
-
-  document.getElementById('sm-corner').textContent = cornerText;
-  document.getElementById('sm-cheek').textContent = cheekText;
-
-  const flagCount = [Math.abs(cornerAvg) >= CORNER_TH, Math.abs(cheekAvg) >= CHEEK_TH].filter(Boolean).length;
-  document.getElementById('sm-comment').textContent =
-    flagCount === 0
-      ? '笑顔での癖は目立って現れていません。'
-      : '普段の会話より、笑顔のときに左右差が出やすいタイプです。表情筋の使い方の癖が影響している可能性があります。';
-
-  document.getElementById('smileResultEmpty').style.display = 'none';
-  document.getElementById('smileResult').style.display = 'block';
-}
-
-// ===== 継続利用機能（端末内保存の履歴・連続記録・初回×最新比較） =====
-const HISTORY_KEY = 'jawAnalyzerHistory';
-
-function loadHistory() {
-  try {
-    return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
-  } catch (e) {
-    return [];
-  }
-}
-
-function saveHistoryRecord(photoDataUrl) {
-  const hist = loadHistory();
-  hist.push({
-    date: new Date().toISOString(),
-    totalScore: document.getElementById('totalScoreNum').textContent,
-    openPct: document.getElementById('ov-open').textContent,
-    shift: document.getElementById('ov-shift').textContent,
-    photo: photoDataUrl || null,
-  });
-  try {
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(hist));
-  } catch (e) {
-    // 容量超過などは記録をスキップ（アプリの動作自体には影響させない）
-  }
-}
-
-// 開口チェック直前に、正面を向いた写真を記録用に1枚保存（実写・鏡像表示に合わせる）
-function captureSnapshot() {
-  try {
-    const w = 240;
-    const h = Math.round((w * video.videoHeight) / video.videoWidth) || 320;
-    const c = document.createElement('canvas');
-    c.width = w;
-    c.height = h;
-    const cctx = c.getContext('2d');
-    cctx.translate(w, 0);
-    cctx.scale(-1, 1);
-    cctx.drawImage(video, 0, 0, w, h);
-    return c.toDataURL('image/jpeg', 0.6);
-  } catch (e) {
-    return null;
-  }
-}
-
-// 継続利用バナー（連続記録日数・前回からの経過日数）
-function renderStreakBanner() {
-  const banner = document.getElementById('streakBanner');
-  const hist = loadHistory();
-
-  if (hist.length === 0) {
-    banner.textContent = '👋 はじめてのチェックです。まずは下のボタンから始めましょう。';
-    banner.style.display = 'block';
-    return;
-  }
-
-  const uniqueDays = new Set(hist.map(h => h.date.slice(0, 10))).size;
-  const last = new Date(hist[hist.length - 1].date);
-  const now = new Date();
-  const diffDays = Math.floor((now - last) / (1000 * 60 * 60 * 24));
-
-  let msg;
-  if (diffDays === 0) {
-    msg = `✅ 本日分は記録済みです（合計${uniqueDays}日分の記録）`;
-  } else if (diffDays === 1) {
-    msg = `📅 前回から1日ぶりです（合計${uniqueDays}日分の記録）`;
-  } else {
-    msg = `📅 前回のチェックから${diffDays}日経っています（合計${uniqueDays}日分の記録）`;
-  }
-  banner.textContent = msg;
-  banner.style.display = 'block';
-}
-
-// 比較タブ（初回×最新）
-function renderCompareTab() {
-  const hist = loadHistory();
-  const empty = document.getElementById('compareEmpty');
-  const wrap = document.getElementById('compareWrap');
-  const comment = document.getElementById('compareComment');
-
-  if (hist.length < 2) {
-    empty.style.display = 'block';
-    wrap.style.display = 'none';
-    comment.style.display = 'none';
-    return;
-  }
-
-  const first = hist[0];
-  const latest = hist[hist.length - 1];
-  const fmt = iso => iso.slice(0, 10).replace(/-/g, '/');
-
-  document.getElementById('compareDateFirst').textContent = `初回（${fmt(first.date)}）`;
-  document.getElementById('compareDateLatest').textContent = `最新（${fmt(latest.date)}）`;
-  if (first.photo) document.getElementById('comparePhotoFirst').src = first.photo;
-  if (latest.photo) document.getElementById('comparePhotoLatest').src = latest.photo;
-  document.getElementById('compareScoreFirst').textContent = first.totalScore;
-  document.getElementById('compareScoreLatest').textContent = latest.totalScore;
-
-  const diff = Number(latest.totalScore) - Number(first.totalScore);
-  comment.textContent = isNaN(diff)
-    ? ''
-    : diff > 0
-    ? `初回から総合スコアが ${diff}点 改善しています。`
-    : diff < 0
-    ? `初回より総合スコアが ${Math.abs(diff)}点 下がっています。焦らず様子を見ていきましょう。`
-    : '初回とスコアはほぼ同じです。';
-  comment.style.display = 'block';
-
-  empty.style.display = 'none';
-  wrap.style.display = 'flex';
-}
-
-// ===== セルフチェック統合フロー（告知→カウントダウン→①開口→②発音→③笑顔） =====
-// ===== 総合まとめ（3つの検査結果を統合して1つの結論にする） =====
-function renderOverallSummary() {
-  const totalScore = Number(document.getElementById('totalScoreNum').textContent) || 0;
-  const CORNER_TH = 3.0, NOSE_TH = 1.5, CHEEK_TH = 4.0;
-
-  const flags = [];
-  if (totalScore > 0 && totalScore < 70) flags.push({ area: '顎', hint: '普段の噛み合わせや姿勢のクセ' });
-  if (Math.abs(lastVowelCornerAvg) >= CORNER_TH) flags.push({ area: '会話時の口角', hint: '片側だけで話す・笑う癖' });
-  if (Math.abs(lastVowelCheekAvg) >= CHEEK_TH) flags.push({ area: '会話時の頬', hint: '頬づえや片側噛みの癖' });
-  if (Math.abs(lastVowelNoseAvg) >= NOSE_TH) flags.push({ area: '鼻の傾き', hint: '片鼻呼吸などの癖' });
-  if (Math.abs(lastSmileCornerAvg) >= CORNER_TH) flags.push({ area: '笑顔の口角', hint: '表情筋の左右差' });
-  if (Math.abs(lastSmileCheekAvg) >= CHEEK_TH) flags.push({ area: '笑顔の頬', hint: '表情筋の左右差' });
-
-  const el = document.getElementById('overallSummary');
-  if (flags.length === 0) {
-    el.innerHTML = '<b>目立った左右差は見つかりませんでした。</b><br>今の状態を維持していきましょう。';
-  } else {
-    const areaList = flags.map(f => f.area).join('・');
-    const topHint = flags[0].hint;
-    el.innerHTML = `<b>${flags.length}か所</b>に左右差が見られます（${areaList}）。<br>${topHint}が影響している可能性があります。`;
-  }
-  el.style.display = 'block';
-}
-
-async function startGuidedCheck() {
-  if (!running) return;
-  const btn = document.getElementById('btnStartCheck');
-  btn.disabled = true;
-  btn.textContent = 'チェック中...';
-  setNumericVisible(false);
-
-  await showAnnounce('グレーの人型に鼻と口を合わせ、\nスマホを動かさずに\nそのまま持っていてください', 2600);
-  await showAnnounce('初めに　顎の歪みを\nチェックします', 1800);
-  await runCountdown();
-  const snapshot = captureSnapshot(); // 開口チェック直前の正面写真を記録用に保存
-  await startJawStageP();
-
-  await showAnnounce('続いて表情チェックに\n進みます', 1800);
-  await runCountdown();
-  await startVowelCheckP();
-
-  await showAnnounce('続いて追加チェックです', 1500);
-  await startSmileStageP();
-
-  setNumericVisible(true);
-  btn.disabled = false;
-  btn.textContent = '🔄 もう一度チェックする';
-
-  // 履歴に記録し、継続バナー・比較タブを更新
-  saveHistoryRecord(snapshot);
-  renderStreakBanner();
-  renderCompareTab();
-  renderOverallSummary();
-
-  // 撮影画面から結果画面へ切り替え（同時に両方は表示しない）
-  document.querySelector('.panel-tab[data-tab="score"]').click();
-  showResultsScreen();
-  const panel = document.getElementById('bottomPanel');
-  panel.classList.add('highlight');
-  setTimeout(() => panel.classList.remove('highlight'), 2800);
-}
-
-// ===== 発音チェック（あ・い・う・え・お） =====
-function startVowelCheck() {
-  if (vowelRecording || !running) return;
-  vowelRecording = true;
-  vowelFrames = [];
-
-  const btn = document.getElementById('btnVowelCheck');
-  btn.disabled = true;
-  btn.textContent = '発音中...';
-
-  const prompt = document.getElementById('vowelPrompt');
-  const bar = document.getElementById('vowelPromptBar');
-  prompt.style.display = 'block';
-  bar.style.width = '0%';
-
-  const duration = 4000; // 4秒間取得
-  const startT = performance.now();
-
-  function tick() {
-    const elapsed = performance.now() - startT;
-    bar.style.width = Math.min(100, (elapsed / duration) * 100) + '%';
-    if (elapsed < duration) {
-      requestAnimationFrame(tick);
-    } else {
-      finishVowelCheck();
-    }
-  }
-  requestAnimationFrame(tick);
-}
-
-function finishVowelCheck() {
-  vowelRecording = false;
-  const btn = document.getElementById('btnVowelCheck');
-  btn.disabled = false;
-  btn.textContent = '🗣 発音チェック';
-  document.getElementById('vowelPrompt').style.display = 'none';
-
-  if (vowelFrames.length < 5) {
-    alert('顔がうまく検出できませんでした。明るい場所でもう一度お試しください。');
-    return;
-  }
-
-  // 口を動かしている区間（開口量がある部分）を優先的に分析対象にする
-  const active = vowelFrames.filter(f => f.openPct > 2);
-  const data = active.length >= 5 ? active : vowelFrames;
-
-  const avg = arr => arr.reduce((s, v) => s + v, 0) / arr.length;
-  const cornerAvg = avg(data.map(f => f.cornerDiffNorm));
-  const noseAvg = avg(data.map(f => f.noseAngle));
-  const cheekAvg = avg(data.map(f => f.cheekWidthDiffNorm));
-  lastVowelCornerAvg = cornerAvg;
-  lastVowelNoseAvg = noseAvg;
-  lastVowelCheekAvg = cheekAvg;
-
-  // しきい値（目安。セルフチェック用の粗い目安であり医学的診断ではありません）
-  const CORNER_TH = 3.0;
-  const NOSE_TH = 1.5;
-  const CHEEK_TH = 4.0;
-
-  let cornerText, noseText, cheekText;
-
-  if (Math.abs(cornerAvg) < CORNER_TH) {
-    cornerText = '左右差は小さく、バランス良く動いています';
-  } else if (cornerAvg > 0) {
-    cornerText = '話すとき、左の口角がやや上がりやすい傾向があります';
-  } else {
-    cornerText = '話すとき、右の口角がやや上がりやすい傾向があります';
-  }
-
-  if (Math.abs(noseAvg) < NOSE_TH) {
-    noseText = '鼻の傾きはほぼ左右対称です';
-  } else if (noseAvg > 0) {
-    noseText = `鼻がやや右に傾く傾向があります（${Math.abs(noseAvg).toFixed(1)}°）`;
-  } else {
-    noseText = `鼻がやや左に傾く傾向があります（${Math.abs(noseAvg).toFixed(1)}°）`;
-  }
-
-  if (Math.abs(cheekAvg) < CHEEK_TH) {
-    cheekText = '頬の左右差は小さいです';
-  } else if (cheekAvg > 0) {
-    cheekText = '発音時、左の頬がやや張り出しやすい傾向があります';
-  } else {
-    cheekText = '発音時、右の頬がやや張り出しやすい傾向があります';
-  }
-
-  document.getElementById('vw-corner').textContent = cornerText;
-  document.getElementById('vw-nose').textContent = noseText;
-  document.getElementById('vw-cheek').textContent = cheekText;
-
-  const flagCount = [
-    Math.abs(cornerAvg) >= CORNER_TH,
-    Math.abs(noseAvg) >= NOSE_TH,
-    Math.abs(cheekAvg) >= CHEEK_TH,
-  ].filter(Boolean).length;
-
-  document.getElementById('vw-comment').textContent =
-    flagCount === 0
-      ? '発音時の癖は目立って現れていません。'
-      : flagCount === 1
-      ? '1つの項目にやや癖が見られます。表情筋の使い方に左右差がある可能性があります。'
-      : '複数の項目に癖が見られます。日常の噛み癖・表情の使い方の左右差が影響している可能性があります。';
-
-  document.getElementById('vowelResultEmpty').style.display = 'none';
-  document.getElementById('vowelResult').style.display = 'block';
-
-  // 発音タブに自動で切り替え
-  document.querySelectorAll('.panel-tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.panel-section').forEach(s => s.classList.remove('active'));
-  document.querySelector('.panel-tab[data-tab="vowel"]').classList.add('active');
-  document.getElementById('tab-vowel').classList.add('active');
-
-  if (typeof afterVowelCheckCallback === 'function') {
-    const cb = afterVowelCheckCallback;
-    afterVowelCheckCallback = null;
-    cb();
-  }
-}
-
-// ===== スロー再生 =====
-function playReplay() {
-  if (recordedFrames.length === 0) return;
-  if (replayTimer) clearInterval(replayTimer);
-  let idx = 0;
-  const speed = parseFloat(document.getElementById('speedSel').value);
-  const interval = Math.round(33 / speed);
-  replayTimer = setInterval(() => {
-    if (idx >= recordedFrames.length) { clearInterval(replayTimer); return; }
-    drawReplayFrame(idx);
-    idx++;
-  }, interval);
-}
-
-function drawReplayFrame(idx) {
-  const f = recordedFrames[idx];
-  const w = replayCanvas.width = replayCanvas.offsetWidth || 140;
-  const h = replayCanvas.height = replayCanvas.offsetHeight || 120;
-  const cW = canvas.width;
-  const cH = canvas.height;
-  const sx = w / cW;
-  const sy = h / cH;
-
-  rpCtx.fillStyle = '#efe6e0';
-  rpCtx.fillRect(0, 0, w, h);
-
-  // 過去軌跡
-  for (let i = Math.max(0, idx-40); i <= idx; i++) {
-    const ff = recordedFrames[i];
-    const a = (i - Math.max(0, idx-40)) / 40;
-    rpCtx.fillStyle = `rgba(99,179,237,${a * 0.8})`;
-    rpCtx.beginPath();
-    rpCtx.arc(ff.jaw.x * sx, ff.jaw.y * sy, 2, 0, Math.PI*2);
-    rpCtx.fill();
-  }
-
-  // 現フレームのキーポイント
-  const pts = [
-    { pt: f.jaw, color: '#63b3ed' },
-    { pt: f.mL, color: '#68d391' },
-    { pt: f.mR, color: '#68d391' },
-    { pt: f.eyeL, color: '#fc8181' },
-    { pt: f.eyeR, color: '#fc8181' },
-  ];
-  pts.forEach(({ pt, color }) => {
-    rpCtx.fillStyle = color;
-    rpCtx.beginPath();
-    rpCtx.arc(pt.x * sx, pt.y * sy, 3, 0, Math.PI*2);
-    rpCtx.fill();
-  });
-
-  // スコア
-  rpCtx.fillStyle = f.totalScore >= 80 ? '#68d391' : f.totalScore >= 60 ? '#f6ad55' : '#fc8181';
-  rpCtx.font = '500 14px sans-serif';
-  rpCtx.fillText(f.totalScore, 4, 16);
-
-  document.getElementById('trajStatus').textContent =
-    `再生: ${idx+1}/${recordedFrames.length} | スコア: ${f.totalScore}`;
-}
-
-// ===== SNSシェア =====
-document.getElementById('shareBtn').addEventListener('click', () => {
-  const url = 'https://kurohiyoko.github.io/jaw-analyzer/jaw-analyzer-v2.html';
-  const text = '波鍼灸院の顎運動セルフチェックアプリで顔の左右バランスを確認しました。';
-  if (navigator.share) {
-    navigator.share({ title: '顎運動セルフチェック', text, url });
-  } else {
-    navigator.clipboard.writeText(url).then(() => {
-      alert('URLをコピーしました。SNSに貼り付けてシェアしてください。');
-    });
-  }
-});
-
-// ===== ON/OFFスイッチ =====
-document.getElementById('mainSwitch').addEventListener('click', function() {
-  analysisOn = !analysisOn;
-  this.classList.toggle('on', analysisOn);
-  if (!analysisOn) {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-  }
-});
-
-// ===== カメラ起動 =====
-document.getElementById('btnGlassesYes').addEventListener('click', () => {
-  document.body.classList.add('large-mode');
-  localStorage.setItem('jawAnalyzerLargeMode', '1');
-  document.getElementById('glassesPrompt').style.display = 'none';
-  document.getElementById('startScreenMain').style.display = 'block';
-});
-document.getElementById('btnGlassesNo').addEventListener('click', () => {
-  document.body.classList.remove('large-mode');
-  localStorage.setItem('jawAnalyzerLargeMode', '0');
-  document.getElementById('glassesPrompt').style.display = 'none';
-  document.getElementById('startScreenMain').style.display = 'block';
-});
-
-document.getElementById('btnStart').addEventListener('click', async () => {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
-    video.srcObject = stream;
-    video.style.display = 'block';
-    document.getElementById('startScreen').style.display = 'none';
-    document.getElementById('camOverlay').style.display = 'block';
-    document.getElementById('bottomPanel').style.display = 'none';
-    setNumericVisible(false);
-    renderStreakBanner();
-    renderCompareTab();
-
-    const mpCam = new Camera(video, {
-      onFrame: async () => { await faceMesh.send({ image: video }); },
-      width: 640, height: 480,
-    });
-    mpCam.start();
-    running = true;
-
-    // 初回のみ、少し待ってから操作ガイドを自動再生
-    if (!localStorage.getItem('jawAnalyzerTourSeen')) {
-      setTimeout(() => tourStart(), 1800);
-    }
-  } catch(e) {
-    alert('カメラへのアクセスが拒否されました。ブラウザの設定を確認してください。');
-  }
-});
-
-// ===== モード切替 =====
-document.querySelectorAll('.mode-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    mode = btn.dataset.mode;
-    jawTrail = [];
-  });
-});
-
-// ===== パネルタブ =====
-document.querySelectorAll('.panel-tab').forEach(tab => {
-  tab.addEventListener('click', () => {
-    document.querySelectorAll('.panel-tab').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.panel-section').forEach(s => s.classList.remove('active'));
-    tab.classList.add('active');
-    document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
-  });
-});
-
-// ===== ボタン =====
-document.getElementById('btnRec').addEventListener('click', () => {
-  recording ? stopRecording() : startRecording();
-});
-document.getElementById('btnVowelCheck').addEventListener('click', startVowelCheck);
-document.getElementById('btnStartCheck').addEventListener('click', startGuidedCheck);
-document.getElementById('btnBackToCamera').addEventListener('click', showCaptureScreen);
-
-// ===== 操作ガイド（ツアー） =====
-const tourSteps = [
-  {
-    selector: '.camera-wrap',
-    title: 'ここに顔を合わせる',
-    text: '点線の枠の中に顔を入れてください。',
-  },
-  {
-    selector: '#btnStartCheck',
-    title: 'ここを押すとチェック開始',
-    text: '「開口チェック」→「発音チェック」の順に自動で進みます。案内に従って動かすだけです。',
-  },
-  {
-    selector: '.panel-tabs',
-    title: 'ここで結果を見る',
-    text: 'チェックが終わると、それぞれの結果に切り替えて確認できます。',
-  },
-];
-
-let tourIndex = 0;
-let tourAutoTimer = null;
-
-function tourShowStep(i) {
-  clearTimeout(tourAutoTimer);
-  const step = tourSteps[i];
-  const target = document.querySelector(step.selector);
-  const overlay = document.getElementById('tourOverlay');
-  const dim = document.getElementById('tourDim');
-  const caption = document.getElementById('tourCaption');
-
-  overlay.style.display = 'block';
-  document.getElementById('tourTitle').textContent = step.title;
-  document.getElementById('tourText').textContent = step.text;
-
-  // ドット
-  const dotsWrap = document.getElementById('tourDots');
-  dotsWrap.innerHTML = '';
-  tourSteps.forEach((_, di) => {
-    const d = document.createElement('div');
-    d.className = 'tour-dot' + (di === i ? ' active' : '');
-    dotsWrap.appendChild(d);
-  });
-
-  // スポットライト（対象要素をくり抜く）
-  if (target) {
-    const r = target.getBoundingClientRect();
-    const pad = 8;
-    const x1 = Math.max(0, r.left - pad), y1 = Math.max(0, r.top - pad);
-    const x2 = r.right + pad, y2 = r.bottom + pad;
-    dim.style.clipPath = `polygon(
-      0 0, 100% 0, 100% 100%, 0 100%, 0 0,
-      ${x1}px ${y1}px, ${x1}px ${y2}px, ${x2}px ${y2}px, ${x2}px ${y1}px, ${x1}px ${y1}px
-    )`;
-
-    // 吹き出しの位置（対象の下、はみ出す場合は上に）
-    const capH = 130;
-    let top = y2 + 12;
-    if (top + capH > window.innerHeight) top = Math.max(8, y1 - capH - 12);
-    let left = Math.min(Math.max(8, r.left), window.innerWidth - 300 - 8);
-    caption.style.top = top + 'px';
-    caption.style.left = left + 'px';
-  } else {
-    dim.style.clipPath = 'none';
-    caption.style.top = '40%';
-    caption.style.left = '50%';
-    caption.style.transform = 'translate(-50%,-50%)';
-  }
-
-  document.getElementById('tourNext').textContent = (i === tourSteps.length - 1) ? '閉じる' : '次へ';
-
-  // 4秒後に自動で次へ（最後のステップでは自動送りしない）
-  if (i < tourSteps.length - 1) {
-    tourAutoTimer = setTimeout(() => tourNextStep(), 4000);
-  }
-}
-
-function tourNextStep() {
-  tourIndex++;
-  if (tourIndex >= tourSteps.length) {
-    tourEnd();
-  } else {
-    tourShowStep(tourIndex);
-  }
-}
-
-function tourEnd() {
-  clearTimeout(tourAutoTimer);
-  document.getElementById('tourOverlay').style.display = 'none';
-  document.getElementById('tourCaption').style.transform = '';
-  localStorage.setItem('jawAnalyzerTourSeen', '1');
-}
-
-function tourStart() {
-  tourIndex = 0;
-  tourShowStep(0);
-}
-
-document.getElementById('btnTour').addEventListener('click', tourStart);
-document.getElementById('tourNext').addEventListener('click', tourNextStep);
-document.getElementById('tourSkip').addEventListener('click', tourEnd);
-document.getElementById('btnClearTraj').addEventListener('click', () => {
-  jawTrail = [];
-  smoothBuf.length = 0;
-});
-
-// ⑤ 保存 = 画面全体スクショ（html2canvas）
-document.getElementById('btnSaveTraj').addEventListener('click', async () => {
-  const btn = document.getElementById('btnSaveTraj');
-  btn.textContent = '保存中...';
-  btn.disabled = true;
-  try {
-    const html2canvas = (await import('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.esm.js')).default;
-    const shot = await html2canvas(document.body, {
-      useCORS: true,
-      allowTaint: true,
-      backgroundColor: '#f7f4e9',
-      scale: window.devicePixelRatio || 1,
-    });
-    const a = document.createElement('a');
-    a.download = `jaw-check-${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.png`;
-    a.href = shot.toDataURL('image/png');
-    a.click();
-  } catch(e) {
-    // フォールバック：canvasだけ保存
-    const a = document.createElement('a');
-    a.download = `jaw-canvas-${Date.now()}.png`;
-    a.href = canvas.toDataURL('image/png');
-    a.click();
-  }
-  btn.textContent = '保存';
-  btn.disabled = false;
-});
-document.getElementById('btnPlay').addEventListener('click', playReplay);
-document.getElementById('btnStop').addEventListener('click', () => {
-  if (replayTimer) clearInterval(replayTimer);
-});
-
-// ===== ローディング =====
-window.addEventListener('load', () => {
-  setTimeout(() => { document.getElementById('loading').style.display = 'none'; }, 1500);
-});
+})();
+</script>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<div id="loading">
+  <div class="spinner"></div>
+  <div class="loading-text">MediaPipeを読み込み中...</div>
+</div>
+
+<header>
+  <div class="logo"><strong>顎運動セルフチェック</strong> | 波鍼灸院</div>
+  <div class="header-right">
+    <button class="tour-btn" id="btnTour">操作ガイド</button>
+    <div class="switch-wrap">
+      <span class="switch-label">解析</span>
+      <div class="switch on" id="mainSwitch"></div>
+    </div>
+    <span class="badge badge-env" id="envBadge">照明確認中</span>
+  </div>
+</header>
+
+<!-- 操作ガイド（ツアー） -->
+<div class="tour-overlay" id="tourOverlay">
+  <div class="tour-dim" id="tourDim"></div>
+  <div class="tour-caption" id="tourCaption">
+    <div class="tour-caption-title" id="tourTitle"></div>
+    <div class="tour-caption-text" id="tourText"></div>
+    <div class="tour-caption-foot">
+      <div class="tour-dots" id="tourDots"></div>
+      <div class="tour-btns">
+        <button class="tour-skip" id="tourSkip">スキップ</button>
+        <button class="tour-next" id="tourNext">次へ</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="main">
+  <!-- カメラ -->
+  <div class="camera-wrap" id="cameraWrap">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="canvas"></canvas>
+
+    <!-- 起動前 -->
+    <div class="start-screen" id="startScreen">
+      <div id="glassesPrompt">
+        <h2 style="font-size:18px;">メガネを外しますか？</h2>
+        <p style="margin-bottom:24px;">外す方は、ボタンや文字を大きくした<br>見やすい画面に切り替えます。</p>
+        <div style="display:flex; flex-direction:column; gap:12px; max-width:280px; margin:0 auto;">
+          <button class="btn-start btn-glasses-yes" id="btnGlassesYes" style="width:100%;">はい（外します）</button>
+          <button class="btn-start btn-glasses-no" id="btnGlassesNo" style="width:100%;">いいえ（そのまま）</button>
+        </div>
+      </div>
+      <div id="experiencePrompt" style="display:none">
+        <h2 style="font-size:18px;">使い方は初めてですか？</h2>
+        <p style="margin-bottom:24px;">初めての方には、カメラを起動した後に<br>使い方ガイドを自動で表示します。</p>
+        <div style="display:flex; flex-direction:column; gap:12px; max-width:280px; margin:0 auto;">
+          <button class="btn-start btn-glasses-yes" id="btnFirstTimeYes" style="width:100%;">初めて</button>
+          <button class="btn-start btn-glasses-no" id="btnFirstTimeNo" style="width:100%;">使ったことがある</button>
+        </div>
+      </div>
+      <div id="startScreenMain" style="display:none">
+        <h2>今日の歪み、チェックしてみましょう</h2>
+        <p>カメラで顎の開閉・顔の歪みをリアルタイム計測します。<br>データはすべてこの端末内で処理されます。</p>
+        <button class="btn-start" id="btnStart">カメラを起動する</button>
+      </div>
+    </div>
+
+    <!-- オーバーレイ -->
+    <div class="cam-overlay" id="camOverlay">
+      <!-- 顔位置・向きの案内（顔の上ではなく画面最上部に固定表示） -->
+      <div class="face-guide-top-msg" id="faceGuideTopMsg" style="display:none;"></div>
+
+      <!-- 傾きインジケーター -->
+      <div class="tilt-indicator" id="tiltIndicator">
+        <div class="tilt-label" id="tiltLabel">スマホ水平</div>
+        <div class="tilt-bar-wrap">
+          <div class="tilt-bar" id="tiltBar"></div>
+        </div>
+      </div>
+
+      <!-- 左右ラベル（鏡像対応） -->
+      <div id="labelLeft" style="
+        position:absolute; left:10px; top:50%;
+        transform:translateY(-50%);
+        font-size:20px; font-weight:700;
+        color:rgba(125,149,163,0.9);
+        background:rgba(255,255,255,0.85);
+        padding:6px 10px; border-radius:6px;
+        letter-spacing:0.05em;
+        border:1px solid rgba(125,149,163,0.28);
+        pointer-events:none;
+      ">左手側</div>
+      <div id="labelRight" style="
+        position:absolute; right:10px; top:50%;
+        transform:translateY(-50%);
+        font-size:20px; font-weight:700;
+        color:rgba(125,149,163,0.9);
+        background:rgba(255,255,255,0.85);
+        padding:6px 10px; border-radius:6px;
+        letter-spacing:0.05em;
+        border:1px solid rgba(125,149,163,0.28);
+        pointer-events:none;
+      ">右手側</div>
+
+      <!-- 環境警告 -->
+      <div class="env-warning" id="envWarning">⚠ 照明を調整してください</div>
+
+      <!-- 継続利用バナー（連続記録日数・リマインダー） -->
+      <div class="streak-banner" id="streakBanner"></div>
+
+      <!-- 開口チェック案内 -->
+      <div class="vowel-prompt" id="jawPrompt">
+        <div class="vowel-prompt-text"><b>① 開口チェック</b><br>ゆっくり口を大きく<br>開け閉めしてください</div>
+        <div class="vowel-prompt-bar-wrap"><div class="vowel-prompt-bar" id="jawPromptBar"></div></div>
+      </div>
+
+      <!-- 発音チェック案内 -->
+      <div class="vowel-prompt" id="vowelPrompt">
+        <div class="vowel-prompt-text"><b>② 発音チェック</b><br>「あ・い・う・え・お」と<br>自然に続けて発音してください</div>
+        <div class="vowel-prompt-bar-wrap"><div class="vowel-prompt-bar" id="vowelPromptBar"></div></div>
+      </div>
+
+      <!-- ステージ間の告知バナー -->
+      <div class="stage-announce" id="stageAnnounce"></div>
+
+      <!-- チェック中止ボタン -->
+      <button class="cancel-check-btn" id="cancelCheckBtn" style="display:none;">✕ やめる</button>
+
+      <!-- カウントダウン（3・2・1） -->
+      <div class="countdown-box" id="countdownBox"></div>
+
+      <!-- 追加チェック（笑顔）：カメラ映像を隠して背景＋文字のみ表示 -->
+      <div class="smile-stage-overlay" id="smileStageOverlay">
+        <div class="smile-stage-text" id="smileStageText"></div>
+      </div>
+
+      <!-- スコアオーバーレイ -->
+      <div class="score-overlay" id="scoreOverlay">
+        <div class="score-chip">
+          <div class="score-chip-label">開口量</div>
+          <div class="score-chip-val neutral" id="ov-open">—</div>
+        </div>
+        <div class="score-chip">
+          <div class="score-chip-label">横ズレ</div>
+          <div class="score-chip-val" id="ov-shift">—</div>
+        </div>
+        <div class="score-chip">
+          <div class="score-chip-label">総合</div>
+          <div class="score-chip-val" id="ov-total">—</div>
+        </div>
+      </div>
+
+      <!-- モード切替 -->
+      <div class="mode-bar" id="modeBar">
+        <button class="mode-btn active" data-mode="skeleton">骨格</button>
+        <button class="mode-btn" data-mode="muscle">筋肉</button>
+        <button class="mode-btn" data-mode="combined">複合</button>
+        <button class="mode-btn" data-mode="avatar">🎭アバター</button>
+      </div>
+
+      <!-- 録画（内部処理用・非表示） -->
+      <div class="rec-btn-wrap" style="display:none;">
+        <button class="rec-btn vowel-btn" id="btnVowelCheck">🗣 発音チェック</button>
+        <button class="rec-btn" id="btnRec">● 録画</button>
+      </div>
+
+      <!-- チェック開始ボタン（統合） -->
+      <div class="start-check-wrap">
+        <button class="start-check-btn" id="btnStartCheck">▶ セルフチェックを始める</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 下パネル -->
+  <div class="bottom-panel" id="bottomPanel">
+    <button class="back-to-camera-btn" id="btnBackToCamera">📷 撮影画面に戻る</button>
+    <div class="panel-tabs">
+      <button class="panel-tab active" data-tab="score">スコア</button>
+      <button class="panel-tab" data-tab="vowel">発音</button>
+      <button class="panel-tab" data-tab="smile">笑顔</button>
+      <button class="panel-tab" data-tab="compare">比較</button>
+      <button class="panel-tab" data-tab="traj">軌跡・再生</button>
+      <button class="panel-tab" data-tab="detail">詳細</button>
+    </div>
+    <div class="panel-body">
+
+      <!-- スコアタブ -->
+      <div class="panel-section active" id="tab-score">
+        <div class="pc-suggest">📺 結果は、画面の大きいパソコンで確認するとさらに見やすいです。</div>
+        <div class="overall-summary" id="overallSummary" style="display:none"></div>
+        <div class="total-score-wrap">
+          <div class="total-score-num" id="totalScoreNum">—</div>
+          <div class="total-score-right">
+            <div class="total-score-label">顔の左右均衡スコア</div>
+            <div class="meter-wrap">
+              <div class="meter-bar" id="meterBar" style="width:0%"></div>
+            </div>
+            <div class="meter-status" id="meterStatus">計測待ち</div>
+          </div>
+        </div>
+        <div class="parts-grid">
+          <div class="part-card">
+            <div class="part-name">目</div>
+            <div class="part-score" id="ps-eye">—</div>
+            <div class="part-bar-wrap"><div class="part-bar" id="pb-eye" style="width:0%"></div></div>
+          </div>
+          <div class="part-card">
+            <div class="part-name">眉</div>
+            <div class="part-score" id="ps-brow">—</div>
+            <div class="part-bar-wrap"><div class="part-bar" id="pb-brow" style="width:0%"></div></div>
+          </div>
+          <div class="part-card">
+            <div class="part-name">頬</div>
+            <div class="part-score" id="ps-cheek">—</div>
+            <div class="part-bar-wrap"><div class="part-bar" id="pb-cheek" style="width:0%"></div></div>
+          </div>
+          <div class="part-card">
+            <div class="part-name">小鼻</div>
+            <div class="part-score" id="ps-nose">—</div>
+            <div class="part-bar-wrap"><div class="part-bar" id="pb-nose" style="width:0%"></div></div>
+          </div>
+          <div class="part-card">
+            <div class="part-name">口元</div>
+            <div class="part-score" id="ps-mouth">—</div>
+            <div class="part-bar-wrap"><div class="part-bar" id="pb-mouth" style="width:0%"></div></div>
+          </div>
+          <div class="part-card">
+            <div class="part-name">輪郭</div>
+            <div class="part-score" id="ps-jaw">—</div>
+            <div class="part-bar-wrap"><div class="part-bar" id="pb-jaw" style="width:0%"></div></div>
+          </div>
+        </div>
+        <button class="share-btn" id="shareBtn">📤 結果をSNSでシェア（リンクのみ）</button>
+      </div>
+
+      <!-- 発音チェックタブ（あ・い・う・え・お） -->
+      <div class="panel-section" id="tab-vowel">
+        <div class="vowel-result-empty" id="vowelResultEmpty">
+          画面下の「▶ セルフチェックを始める」から、案内に従って発音すると結果が表示されます。
+        </div>
+        <div class="vowel-result" id="vowelResult" style="display:none">
+          <div class="vowel-item">
+            <div class="vowel-item-label">口角の癖</div>
+            <div class="vowel-item-val" id="vw-corner">—</div>
+          </div>
+          <div class="vowel-item">
+            <div class="vowel-item-label">鼻の傾き</div>
+            <div class="vowel-item-val" id="vw-nose">—</div>
+          </div>
+          <div class="vowel-item">
+            <div class="vowel-item-label">頬の左右差</div>
+            <div class="vowel-item-val" id="vw-cheek">—</div>
+          </div>
+          <div class="vowel-comment" id="vw-comment"></div>
+        </div>
+      </div>
+
+      <!-- 笑顔チェックタブ（追加チェック） -->
+      <div class="panel-section" id="tab-smile">
+        <div class="vowel-result-empty" id="smileResultEmpty">
+          画面下の「▶ セルフチェックを始める」の最後に「笑ってください」という案内が出ます。笑顔のときの左右差はここに表示されます。
+        </div>
+        <div class="vowel-result" id="smileResult" style="display:none">
+          <img class="compare-photo" id="smilePhoto" alt="笑顔の写真" style="max-width:160px;margin-bottom:8px;">
+          <div class="vowel-item">
+            <div class="vowel-item-label">笑顔の口角の癖</div>
+            <div class="vowel-item-val" id="sm-corner">—</div>
+          </div>
+          <div class="vowel-item">
+            <div class="vowel-item-label">笑顔時の頬の左右差</div>
+            <div class="vowel-item-val" id="sm-cheek">—</div>
+          </div>
+          <div class="vowel-comment" id="sm-comment"></div>
+        </div>
+      </div>
+
+      <!-- 比較タブ（初回×最新の記録） -->
+      <div class="panel-section" id="tab-compare">
+        <div class="vowel-result-empty" id="compareEmpty">
+          まだ記録が1件しかありません。日をあけてもう一度チェックすると、初回と最新の変化を比べられます。
+        </div>
+        <div class="compare-wrap" id="compareWrap" style="display:none">
+          <div class="compare-col">
+            <div class="compare-label" id="compareDateFirst">初回</div>
+            <img class="compare-photo" id="comparePhotoFirst" alt="初回の記録">
+            <div class="compare-score" id="compareScoreFirst">—</div>
+          </div>
+          <div class="compare-col">
+            <div class="compare-label" id="compareDateLatest">最新</div>
+            <img class="compare-photo" id="comparePhotoLatest" alt="最新の記録">
+            <div class="compare-score" id="compareScoreLatest">—</div>
+          </div>
+        </div>
+        <div class="vowel-comment" id="compareComment" style="display:none"></div>
+        <div class="vowel-result-empty" style="margin-top:10px;">
+          💡 写真の顔の大きさをきれいにそろえたい場合は、別ツール「顔サイズそろえツール」もご利用いただけます（任意・使わなくても記録は続けられます）。
+        </div>
+      </div>
+
+      <!-- 軌跡・再生タブ -->
+      <div class="panel-section" id="tab-traj">
+        <div class="vowel-result-empty" style="margin-bottom:8px;">
+          👄 これは「①開口チェック」のときの、顎の動きの記録です。
+        </div>
+        <div class="traj-replay-wrap" style="grid-template-columns:1fr;">
+          <div class="mini-canvas-wrap">
+            <div class="mini-canvas-label">開口動作のスロー再生</div>
+            <canvas class="mini-c" id="replayCanvas" width="280" height="200"></canvas>
+            <div class="replay-controls">
+              <button class="ctrl-sm" id="btnPlay">▶</button>
+              <button class="ctrl-sm" id="btnStop">■</button>
+              <select class="speed-sel" id="speedSel">
+                <option value="0.25">0.25×</option>
+                <option value="0.5">0.5×</option>
+                <option value="1">1×</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <details class="traj-optional">
+          <summary>詳しく見る（軌跡グラフ・カクつき検知）</summary>
+          <div class="traj-replay-wrap">
+            <div class="mini-canvas-wrap">
+              <div class="mini-canvas-label">顎の開口軌跡</div>
+              <canvas class="mini-c" id="trajCanvas" width="140" height="120"></canvas>
+              <div style="display:flex;gap:4px;margin-top:4px">
+                <button class="ctrl-sm" id="btnClearTraj">クリア</button>
+                <button class="ctrl-sm" id="btnSaveTraj">保存</button>
+              </div>
+            </div>
+          </div>
+          <div class="jerk-wrap">
+            <div class="jerk-label">カクつき検知</div>
+            <canvas id="jerkCanvas" width="300" height="50" style="width:100%;display:block;border-radius:3px"></canvas>
+          </div>
+        </details>
+
+        <div style="font-size:10px;color:var(--text2);text-align:center" id="trajStatus">録画後に再生できます</div>
+      </div>
+
+      <!-- 詳細タブ -->
+      <div class="panel-section" id="tab-detail">
+        <div class="detail-grid">
+          <div class="detail-item">
+            <span class="detail-label">開口量</span>
+            <span class="detail-val" id="d-open">—</span>
+          </div>
+          <div class="detail-item">
+            <span class="detail-label">顎横ズレ</span>
+            <span class="detail-val" id="d-shift">—</span>
+          </div>
+          <div class="detail-item">
+            <span class="detail-label">口角高さ差</span>
+            <span class="detail-val" id="d-corner">—</span>
+          </div>
+          <div class="detail-item">
+            <span class="detail-label">目の傾き</span>
+            <span class="detail-val" id="d-eyetilt">—</span>
+          </div>
+          <div class="detail-item">
+            <span class="detail-label">眉の高さ差</span>
+            <span class="detail-val" id="d-brow">—</span>
+          </div>
+          <div class="detail-item">
+            <span class="detail-label">小鼻の左右差</span>
+            <span class="detail-val" id="d-nostril">—</span>
+          </div>
+          <div class="detail-item">
+            <span class="detail-label">頬の左右差</span>
+            <span class="detail-val" id="d-cheek">—</span>
+          </div>
+          <div class="detail-item">
+            <span class="detail-label">スマホ傾き</span>
+            <span class="detail-val" id="d-device">—</span>
+          </div>
+        </div>
+        <div style="font-size:10px;color:var(--text2);line-height:1.7;margin-top:10px;padding:8px;background:rgba(246,173,85,0.06);border:1px solid rgba(246,173,85,0.2);border-radius:5px">
+          このアプリは皮膚・表情の動きを解析するセルフチェックツールです。医療診断・治療の代替にはなりません。顔データはサーバーに送信されません。
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+<script src="script.js?v=2"></script>
+</body>
+</html>
